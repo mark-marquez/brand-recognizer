@@ -6,4 +6,4 @@ result*
 weights*brand-recognizer-env/
 brand-recognizer-env/
 CRAFT-pytorch/.git
-CRAFT-pytorch/.git
+.DS_Store

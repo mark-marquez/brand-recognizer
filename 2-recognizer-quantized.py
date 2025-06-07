@@ -5,18 +5,16 @@ import numpy as np
 from ultralytics import YOLO
 
 # Add YOLO model
-yolo_model = YOLO('best.pt')  # Update path if needed
+yolo_model = YOLO('best.pt') 
 
 reader = easyocr.Reader(['en'], gpu=False, quantize=True)
 cam = Picamera2()
 cam.configure(cam.create_preview_configuration({"size": (640, 480)}))
 cam.start()
 
-# Resize parameters for OCR
-OCR_WIDTH = 320  # Target width for OCR processing
-
 while True:
     frame = cam.capture_array()
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)  # Convert from 4-channel BGRA to 3-channel RGB
     
     # Use YOLO to detect regions
     yolo_results = yolo_model(frame)
@@ -28,22 +26,14 @@ while True:
                 roi = frame[y1:y2, x1:x2]
                 
                 if roi.size > 0:
-                    # Resize ROI for faster OCR
-                    roi_height, roi_width = roi.shape[:2]
-                    scale = OCR_WIDTH / roi_width
-                    new_height = int(roi_height * scale)
-                    roi_resized = cv2.resize(roi, (OCR_WIDTH, new_height))
-                    
-                    # Run EasyOCR on resized region
-                    results = reader.readtext(roi_resized)
+                    # Run EasyOCR on detected region
+                    results = reader.readtext(roi)
                     
                     for bbox, text, conf in results:
-                        # Adjust bbox coordinates back to original size then to frame
+                        # Adjust bbox coordinates to frame
                         pts = []
                         for pt in bbox:
-                            orig_x = int(pt[0] / scale)
-                            orig_y = int(pt[1] / scale)
-                            pts.append((orig_x + x1, orig_y + y1))
+                            pts.append((int(pt[0] + x1), int(pt[1] + y1)))
                         
                         # Draw bounding box
                         cv2.polylines(frame, [np.array(pts)], isClosed=True, color=(0,255,0), thickness=2)

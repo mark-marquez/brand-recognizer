@@ -17,6 +17,7 @@ OCR_WIDTH = 320  # Target width for OCR processing
 
 while True:
     frame = cam.capture_array()
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)  # Convert from 4-channel BGRA to 3-channel RGB
     
     # Use YOLO to detect regions
     yolo_results = yolo_model(frame)

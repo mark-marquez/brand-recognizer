@@ -8,7 +8,7 @@ import time
 from queue import Queue
 
 # Initialize models
-yolo_model = YOLO('best.pt')
+yolo_model = YOLO('best-june-08.pt')
 reader = easyocr.Reader(['en'], gpu=False, quantize=True)
 
 # Initialize camera
@@ -63,11 +63,16 @@ def ocr_loop():
 # Start OCR thread
 threading.Thread(target=ocr_loop, daemon=True).start()
 
+frame_count = 0
+OCR_INTERVAL = 5  # Only send frames to OCR every 5 frames
+
 # Main display loop
 while True:
     frame = cam.capture_array()
     frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
     
+    frame_count += 1
+
     # Use YOLO to detect regions
     yolo_results = yolo_model(frame)
     
@@ -77,7 +82,7 @@ while True:
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
                 
                 # Add region to OCR queue if not full
-                if not ocr_queue.full():
+                if frame_count % OCR_INTERVAL == 0 and not ocr_queue.full():
                     roi = frame[y1:y2, x1:x2]
                     try:
                         ocr_queue.put_nowait((roi, x1, y1))

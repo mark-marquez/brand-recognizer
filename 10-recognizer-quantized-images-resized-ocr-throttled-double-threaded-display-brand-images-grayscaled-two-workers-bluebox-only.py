@@ -25,6 +25,12 @@ ocr_queue = Queue(maxsize=10)
 current_ocr_results = []  # List of (pts, text, conf) for current frame
 ocr_lock = threading.Lock()
 
+# Helper function to check if an image is blurry
+def is_blurry(image, threshold=100.0):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    return lap_var < threshold
+
 def ocr_loop():
     """Background thread for OCR processing"""
     while True:
@@ -45,14 +51,20 @@ def ocr_loop():
                 
                 # Process results
                 temp_results = []
+                grouped_text = []
                 for bbox, text, conf in results:
-                    if conf > 0.25:
-                        scaled_pts = []
-                        for pt in bbox:
-                            orig_x = int(pt[0] / scale)
-                            orig_y = int(pt[1] / scale)
-                            scaled_pts.append((orig_x + x1, orig_y + y1))
-                        temp_results.append((scaled_pts, text, conf))
+                    if conf > 0.5:
+                        grouped_text.append((bbox, text, conf))
+
+                if grouped_text:
+                    all_text = " ".join(text for _, text, _ in grouped_text)
+                    highest_conf = max(conf for _, _, conf in grouped_text)
+                    scaled_pts = []
+                    for pt in grouped_text[0][0]:  # use first bbox for positioning
+                        orig_x = int(pt[0] / scale)
+                        orig_y = int(pt[1] / scale)
+                        scaled_pts.append((orig_x + x1, orig_y + y1))
+                    temp_results.append((scaled_pts, all_text, highest_conf))
                 
                 # Replace current results with new ones
                 with ocr_lock:
@@ -82,13 +94,14 @@ while True:
             for box in r.boxes:
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
                 
-                # Add region to OCR queue if not full
+                # Add region to OCR queue if not full and not blurry
                 if frame_count % OCR_INTERVAL == 0 and not ocr_queue.full():
                     roi = frame[y1:y2, x1:x2]
-                    try:
-                        ocr_queue.put_nowait((roi, x1, y1))
-                    except:
-                        pass  # Queue full, skip this frame
+                    if not is_blurry(roi):
+                        try:
+                            ocr_queue.put_nowait((roi, x1, y1))
+                        except:
+                            pass  # Queue full, skip this frame
                 
                 # Draw YOLO box
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)

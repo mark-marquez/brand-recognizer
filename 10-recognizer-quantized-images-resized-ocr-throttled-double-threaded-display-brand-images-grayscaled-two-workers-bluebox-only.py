@@ -25,6 +25,12 @@ ocr_queue = Queue(maxsize=10)
 current_ocr_results = []  # List of (pts, text, conf) for current frame
 ocr_lock = threading.Lock()
 
+latest_frame = None
+latest_yolo_frame = None
+yolo_lock = threading.Lock()
+
+latest_boxes = []
+
 # Helper function to check if an image is blurry
 def is_blurry(image, threshold=100.0):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -47,7 +53,7 @@ def ocr_loop():
                 roi_resized = cv2.cvtColor(roi_resized, cv2.COLOR_BGR2GRAY)
                 
                 # Run EasyOCR on resized region
-                results = reader.readtext(roi_resized, batch_size=1, workers=2)
+                results = reader.readtext(roi_resized, batch_size=1, workers=1)
                 
                 # Process results
                 temp_results = []
@@ -74,59 +80,92 @@ def ocr_loop():
         except:
             continue  # Handle timeout or other errors
 
+def yolo_loop():
+    global latest_frame
+    global latest_yolo_frame
+    global latest_boxes
+    frame_count = 0
+    while True:
+        if latest_frame is not None:
+            frame_copy = latest_frame
+            yolo_results = yolo_model(frame_copy) if (frame_count % 5 == 0) else [type('obj', (object,), {'boxes': None})()]
+            if frame_count % 5 == 0:
+                for r in yolo_results:
+                    if r.boxes is not None:
+                        for box in r.boxes:
+                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                            cv2.rectangle(frame_copy, (x1, y1), (x2, y2), (255, 0, 0), 2)
+            frame_count += 1
+            
+            new_boxes = []
+            for r in yolo_results:
+                if r.boxes is not None:
+                    for box in r.boxes:
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                        new_boxes.append((x1, y1, x2, y2))
+                        print(f"YOLO Detected box: ({x1}, {y1}), ({x2}, {y2})")
+                        roi = frame_copy[y1:y2, x1:x2]
+                        if not ocr_queue.full() and not is_blurry(roi):
+                            try:
+                                ocr_queue.put_nowait((roi, x1, y1))
+                            except:
+                                pass
+            with yolo_lock:
+                latest_boxes.clear()
+                latest_boxes.extend(new_boxes)
+                print("Updated latest_boxes with", len(new_boxes), "boxes")
+
 # Start OCR thread
 threading.Thread(target=ocr_loop, daemon=True).start()
 
-frame_count = 0
-OCR_INTERVAL = 5  # Only send frames to OCR every 5 frames
+
+latest_yolo_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+threading.Thread(target=yolo_loop, daemon=True).start()
 
 # Main display loop
+boxes_to_draw = []
+last_box_time = 0
+
 while True:
     frame = cam.capture_array()
-    frame_count += 1
     frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
-    
-    # Use YOLO to detect regions
-    yolo_results = yolo_model(frame)
-    
-    for r in yolo_results:
-        if r.boxes is not None:
-            for box in r.boxes:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-                
-                # Add region to OCR queue if not full and not blurry
-                if frame_count % OCR_INTERVAL == 0 and not ocr_queue.full():
-                    roi = frame[y1:y2, x1:x2]
-                    if not is_blurry(roi):
-                        try:
-                            ocr_queue.put_nowait((roi, x1, y1))
-                        except:
-                            pass  # Queue full, skip this frame
-                
-                # Draw YOLO box
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-    
-    # Draw current OCR results (drawing skipped: green boxes and text not shown)
+    latest_frame = frame
+
+    with yolo_lock:
+        if latest_boxes:
+            last_box_time = time.time()
+            boxes_to_draw = latest_boxes.copy()
+        elif time.time() - last_box_time < 3:
+            boxes_to_draw = boxes_to_draw  # reuse previous
+        else:
+            boxes_to_draw = []
+
+    print("Drawing", len(boxes_to_draw), "boxes")
+
+    display_frame = latest_frame.copy() if latest_frame is not None else np.zeros((480, 640, 3), dtype=np.uint8)
+
+    # Box drawing now handled in yolo_loop; do not draw here
+
+    # Draw current OCR results
     with ocr_lock:
         results_to_draw = list(current_ocr_results)
-    
+
     # Create black strip for text display
     strip_height = 60
-    text_panel = np.zeros((strip_height, frame.shape[1], 3), dtype=np.uint8)
+    text_panel = np.zeros((strip_height, display_frame.shape[1], 3), dtype=np.uint8)
 
     # Compose line of text
     if results_to_draw:
-        best_result = max(results_to_draw, key=lambda x: x[2])  # x[2] is confidence
+        best_result = max(results_to_draw, key=lambda x: x[2])
         full_line = "BRAND NAME: " + best_result[1]
     else:
         full_line = "BRAND NAME: "
     cv2.putText(text_panel, full_line, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
 
     # Stack frame and text panel
-    combined = np.vstack((frame, text_panel))
-    
+    combined = np.vstack((display_frame, text_panel))
     cv2.imshow("OCR Feed", combined)
-    
+
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 

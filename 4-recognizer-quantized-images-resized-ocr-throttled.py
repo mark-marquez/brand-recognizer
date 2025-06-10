@@ -5,7 +5,7 @@ import numpy as np
 from ultralytics import YOLO
 
 # Add YOLO model
-yolo_model = YOLO('best.pt')  # Update path if needed
+yolo_model = YOLO('best-june-08.pt')  # Update path if needed
 
 reader = easyocr.Reader(['en'], gpu=False, quantize=True)
 cam = Picamera2()

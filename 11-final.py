@@ -9,7 +9,8 @@
 # 8. easyocr allowlist
 # 9. YOLO input resolution reduced
 # 10. YOLO detector throttled
-# 11. OCRreader Batch size = 2 and workers = 2
+# 11. YOLO model quantized
+# 12. Cascading - first YOLO logo detection, then OCR
 
 
 import easyocr
@@ -22,7 +23,8 @@ import time
 from queue import Queue
 
 # Initialize models
-yolo_model = YOLO('best-june-08.pt')
+yolo_model = YOLO('best-june-08_int8.tflite', task='detect')
+# yolo_model = YOLO('best-june-08.pt', task='detect')
 reader = easyocr.Reader(['en'], gpu=False, quantize=True)
 
 # Initialize camera

@@ -1,16 +1,17 @@
 # OPTIMIZATIONS
-# 1. images resized
-# 2. ocr throttled
-# 3. double threaded 
-# 4. display brand 
-# 5. images grayscaled
-# 6. bluebox only
+# 1. images resized before easyocr processing
+# 2. ocr only runs when yolo logo box detected
+# 3. double threaded - main thread handles camera feed and yolo, secondary thread handles ocr processing
+# 4. display brand - black display box at bottom of image
+# 5. images grayscaled - before being processed by easyocr 
+# 6. bluebox only - not showing easyocr's character region boxes
 # 7. easyocr recognition model quantized
-# 8. easyocr allowlist
-# 9. YOLO input resolution reduced
-# 10. YOLO detector throttled
+# 8. easyocr allowlist - only looking for alphabetic characters
+# 9. images resized before yolo processing
+# 10. yolo throttled to every 3 images and 
 # 11. YOLO model quantized
-# 12. Cascading - first YOLO logo detection, then OCR
+# 12. Cascading - first YOLO logo detection, then easyOCR (CRAFT detection and easyocr character recognition)
+# 13. Camera fixed to improve frame stabilization
 
 
 import easyocr
@@ -36,7 +37,7 @@ cam.start()
 YOLO_WIDTH = 320   # Target width for YOLO processing (faster)
 OCR_WIDTH = 320    # Target width for OCR processing
 
-# --- STEP 1: Add variables for YOLO throttling ---
+
 YOLO_INTERVAL = 3  # Run YOLO detection only every 3 frames
 OCR_INTERVAL = 5   # Only send frames to OCR every 5 frames (must be >= YOLO_INTERVAL)
 last_yolo_boxes = [] # To store the boxes from the last detection
@@ -95,7 +96,7 @@ while True:
     frame_count += 1
     frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
     
-    # --- STEP 2: Gate the YOLO detection and OCR queuing ---
+
     if frame_count % YOLO_INTERVAL == 0:
         # Resize frame before running YOLO
         original_h, original_w = frame.shape[:2]

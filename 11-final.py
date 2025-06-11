@@ -137,8 +137,6 @@ def main():
 
             # If YOLO finds no objects, clear previous (now stale) results.
             if not last_yolo_boxes:
-                with ocr_lock:
-                    current_ocr_results.clear()
                 with ocr_queue.mutex:
                     ocr_queue.queue.clear()
 

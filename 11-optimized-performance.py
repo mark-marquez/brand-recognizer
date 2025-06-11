@@ -20,9 +20,11 @@ import cv2
 import numpy as np
 import threading
 from queue import Queue, Empty, Full
+import time
+import psutil
 
 import easyocr
-from picamera2 import Picamera2
+from picamera2 import Picamera2, controls
 from ultralytics import YOLO
 
 # --- Configuration ---
@@ -33,6 +35,7 @@ OCR_WIDTH = 320
 
 YOLO_INTERVAL = 3  # Run YOLO detection every N frames.
 OCR_INTERVAL = 5   # Queue regions for OCR every N frames.
+SHARPNESS_THRESHOLD = 100.0 # Tune this value; higher is stricter.
 
 # --- Initialization ---
 yolo_model = YOLO('best-june-08_int8.tflite', task='detect')
@@ -40,6 +43,7 @@ ocr_reader = easyocr.Reader(['en'], gpu=False, quantize=True)
 
 cam = Picamera2()
 cam.configure(cam.create_preview_configuration({"size": (FRAME_WIDTH, FRAME_HEIGHT)}))
+cam.set_controls({"AfMode": 0, "LensPosition": 2})
 cam.start()
 
 # --- Shared Resources for Threading ---
@@ -47,6 +51,15 @@ ocr_queue = Queue(maxsize=10)
 last_yolo_boxes = []
 current_ocr_results = []
 ocr_lock = threading.Lock()
+
+def calculate_sharpness(image: np.ndarray) -> float:
+    """Calculates a sharpness score for an image using the variance of the Laplacian."""
+    if image.size == 0:
+        return 0.0
+    # Convert to grayscale and compute the variance of the Laplacian
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    return laplacian_var
 
 def ocr_processing_thread():
     """
@@ -105,7 +118,17 @@ def main():
     # Start the background OCR processing thread.
     threading.Thread(target=ocr_processing_thread, daemon=True).start()
 
+    prev_time = 0
+    fps_readings = []
+    cpu_readings = []
+    process = psutil.Process()
+    run_start_time = time.time()
+
     while True:
+        if time.time() - run_start_time > 30:
+            print("30-second test duration complete. Exiting...")
+            break
+
         frame = cam.capture_array()
         frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
         frame_count += 1
@@ -128,10 +151,21 @@ def main():
                     new_boxes.append((x1, y1, x2, y2))
 
                     if should_queue_for_ocr and not ocr_queue.full():
-                        try:
-                            ocr_queue.put_nowait((frame[y1:y2, x1:x2], x1, y1))
-                        except Full:
-                            pass
+                        # Extract the region of interest (ROI)
+                        roi = frame[y1:y2, x1:x2]
+                        
+                        # Calculate sharpness of the ROI
+                        sharpness = calculate_sharpness(roi)
+                        
+                        # --- For Tuning: Uncomment the line below to see sharpness scores ---
+                        # print(f"Detected sharpness: {sharpness:.2f}")
+
+                        # Only queue the ROI if it's sharp enough
+                        if sharpness > SHARPNESS_THRESHOLD:
+                            try:
+                                ocr_queue.put_nowait((roi, x1, y1))
+                            except Full:
+                                pass
             
             last_yolo_boxes = new_boxes
 
@@ -154,11 +188,29 @@ def main():
         cv2.putText(text_panel, f"BRAND NAME: {recognized_text}", (10, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
 
+        current_time = time.time()
+        if prev_time > 0:
+            fps = 1 / (current_time - prev_time)
+            fps_readings.append(fps)
+            cpu_readings.append(process.cpu_percent())
+        prev_time = current_time
+
         combined_view = np.vstack((frame, text_panel))
         cv2.imshow("Brand Recognizer", combined_view)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
+            
+    if fps_readings:
+        average_fps = sum(fps_readings) / len(fps_readings)
+        average_cpu = sum(cpu_readings[1:]) / len(cpu_readings[1:]) if len(cpu_readings) > 1 else 0
+
+        print(f"Optimized Average FPS: {average_fps:.2f}")
+        print(f"Optimized Average CPU Utilization: {average_cpu:.2f}%")
+    
+        with open("optimized_performance.txt", "w") as f:
+            f.write(f"Average FPS: {average_fps:.2f}\n")
+            f.write(f"Average CPU Utilization: {average_cpu:.2f}%\n")
 
     cv2.destroyAllWindows()
     cam.stop()

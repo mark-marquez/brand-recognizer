@@ -1,0 +1,2 @@
+Average FPS: 48.55
+Average CPU Utilization: 208.48%

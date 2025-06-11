@@ -1,173 +1,169 @@
-# OPTIMIZATIONS
-# 1. images resized before easyocr processing
-# 2. ocr only runs when yolo logo box detected
-# 3. double threaded - main thread handles camera feed and yolo, secondary thread handles ocr processing
-# 4. display brand - black display box at bottom of image
-# 5. images grayscaled - before being processed by easyocr 
-# 6. bluebox only - not showing easyocr's character region boxes
-# 7. easyocr recognition model quantized
-# 8. easyocr allowlist - only looking for alphabetic characters
-# 9. images resized before yolo processing
-# 10. yolo throttled to every 3 images and 
-# 11. YOLO model quantized
-# 12. Cascading - first YOLO logo detection, then easyOCR (CRAFT detection and easyocr character recognition)
-# 13. Camera fixed to improve frame stabilization
+# --- OPTIMIZATIONS ---
+#
+# 1.  Cascading Pipeline: A fast YOLO model first finds the general logo area.
+# 2.  Region-Specific OCR: The slower OCR process only runs on the small image region detected by YOLO.
+# 3.  Multi-Threading: A secondary thread handles all OCR work so it doesn't block or slow down the main camera feed.
+# 4.  YOLO Input Resizing: Full camera frames are downscaled before YOLO processing to speed up inference.
+# 5.  YOLO Model Quantization: Uses a quantized .tflite model for faster, more efficient execution on edge devices.
+# 6.  YOLO Throttling: YOLO detection is skipped on most frames and only runs intermittently (e.g., every 3rd frame).
+# 7.  OCR Input Resizing: The cropped logo region is resized again before being sent to EasyOCR.
+# 8.  Grayscale Conversion: Images are converted to grayscale before OCR, a common and efficient preprocessing step.
+# 9.  Contrast Enhancement (CLAHE): Applies CLAHE to the grayscale image to improve text visibility in varied lighting.
+# 10. OCR Model Quantization: The EasyOCR recognition model itself is quantized for better performance.
+# 11. OCR Character Filtering: Uses an `allowlist` to restrict OCR to only search for alphabetic characters, speeding up recognition.
+# 12. OCR Throttling: Queuing new regions for the OCR thread is independently throttled (e.g., every 5th frame).
+# 13. Stable Visuals: The last detected bounding box is drawn on every single frame, preventing a "flickering" effect.
+# 14. Simplified Display: Only the main blue bounding box from YOLO is rendered, not the individual word boxes from OCR.
+# 15. Efficient Data Clearing: When a logo is no longer detected, the pending OCR queue is cleared instantly.
 
+import cv2
+import numpy as np
+import threading
+from queue import Queue, Empty, Full
 
 import easyocr
 from picamera2 import Picamera2
-import cv2
-import numpy as np
 from ultralytics import YOLO
-import threading
-import time
-from queue import Queue
 
-# Initialize models
+# --- Configuration ---
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
+YOLO_WIDTH = 320
+OCR_WIDTH = 320
+
+YOLO_INTERVAL = 3  # Run YOLO detection every N frames.
+OCR_INTERVAL = 5   # Queue regions for OCR every N frames.
+
+# --- Initialization ---
 yolo_model = YOLO('best-june-08_int8.tflite', task='detect')
-# yolo_model = YOLO('best-june-08.pt', task='detect')
-reader = easyocr.Reader(['en'], gpu=False, quantize=True)
+ocr_reader = easyocr.Reader(['en'], gpu=False, quantize=True)
 
-# Initialize camera
 cam = Picamera2()
-cam.configure(cam.create_preview_configuration({"size": (640, 480)}))
+cam.configure(cam.create_preview_configuration({"size": (FRAME_WIDTH, FRAME_HEIGHT)}))
 cam.start()
 
-# Resize parameters
-YOLO_WIDTH = 320   # Target width for YOLO processing (faster)
-OCR_WIDTH = 320    # Target width for OCR processing
-
-
-YOLO_INTERVAL = 3  # Run YOLO detection only every 3 frames
-OCR_INTERVAL = 5   # Only send frames to OCR every 5 frames (must be >= YOLO_INTERVAL)
-last_yolo_boxes = [] # To store the boxes from the last detection
-
-# Shared OCR results
+# --- Shared Resources for Threading ---
 ocr_queue = Queue(maxsize=10)
-current_ocr_results = []  # List of (pts, text, conf) for current frame
+last_yolo_boxes = []
+current_ocr_results = []
 ocr_lock = threading.Lock()
 
-def ocr_loop():
-    """Background thread for OCR processing"""
+def ocr_processing_thread():
+    """
+    Background thread to run OCR on image regions from a queue.
+    This function preprocesses images and safely updates shared results.
+    """
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+    allow_list = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz '
+
     while True:
         try:
-            # Get next region to process (blocks if queue is empty)
-            roi, x1, y1 = ocr_queue.get(timeout=1)
-            
-            if roi.size > 0:
-                # Resize ROI for faster OCR
-                roi_height, roi_width = roi.shape[:2]
-                scale = OCR_WIDTH / roi_width
-                new_height = int(roi_height * scale)
-                roi_resized = cv2.resize(roi, (OCR_WIDTH, new_height))
-                roi_resized = cv2.cvtColor(roi_resized, cv2.COLOR_BGR2GRAY)
-                
-                # Run EasyOCR on resized region
-                allow_list = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz '
-                results = reader.readtext(roi_resized, batch_size=1, workers=1, allowlist=allow_list)
-                
-                # Process results
-                temp_results = []
-                for bbox, text, conf in results:
-                    # Adjust bbox coordinates back to frame
-                    scaled_pts = []
-                    for pt in bbox:
-                        orig_x = int(pt[0] / scale)
-                        orig_y = int(pt[1] / scale)
-                        scaled_pts.append((orig_x + x1, orig_y + y1))
-                    temp_results.append((scaled_pts, text, conf))
-                
-                # Replace current results with new ones
-                with ocr_lock:
-                    current_ocr_results.clear()
-                    current_ocr_results.extend(temp_results)
-                    
-        except:
-            continue  # Handle timeout or other errors
+            roi, x_offset, y_offset = ocr_queue.get(timeout=1)
+        except Empty:
+            continue
 
-# Start OCR thread
-threading.Thread(target=ocr_loop, daemon=True).start()
+        if roi.size == 0:
+            continue
 
-frame_count = 0
+        # Preprocess ROI for better OCR accuracy.
+        roi_height, roi_width = roi.shape[:2]
+        scale = OCR_WIDTH / roi_width
+        new_height = int(roi_height * scale)
+        roi_resized = cv2.resize(roi, (OCR_WIDTH, new_height))
+        gray_roi = cv2.cvtColor(roi_resized, cv2.COLOR_BGR2GRAY)
+        enhanced_roi = clahe.apply(gray_roi)
 
-# Main display loop
-while True:
-    frame = cam.capture_array()
-    frame_count += 1
-    frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
-    
+        results = ocr_reader.readtext(
+            enhanced_roi, batch_size=1, workers=1, allowlist=allow_list
+        )
 
-    if frame_count % YOLO_INTERVAL == 0:
-        # Resize frame before running YOLO
-        original_h, original_w = frame.shape[:2]
-        yolo_h = int(original_h * (YOLO_WIDTH / original_w))
-        frame_resized_for_yolo = cv2.resize(frame, (YOLO_WIDTH, yolo_h))
+        # Scale recognized text bounding boxes back to original frame coordinates.
+        processed_results = []
+        for bbox, text, conf in results:
+            scaled_pts = [
+                (int(pt[0] / scale) + x_offset, int(pt[1] / scale) + y_offset)
+                for pt in bbox
+            ]
+            processed_results.append((scaled_pts, text, conf))
 
-        # Use YOLO to detect regions on the smaller frame
-        yolo_results = yolo_model(frame_resized_for_yolo, conf=0.25)
-        
-        # Clear the list of last known boxes
-        last_yolo_boxes.clear()
+        with ocr_lock:
+            current_ocr_results.clear()
+            current_ocr_results.extend(processed_results)
 
-        for r in yolo_results:
-            if r.boxes is not None:
+def main():
+    """
+    Main loop to capture frames, run object detection, and display results.
+    """
+    global last_yolo_boxes, current_ocr_results
+    frame_count = 0
+
+    # Pre-calculate scaling factors for resizing bounding boxes.
+    yolo_h = int(FRAME_HEIGHT * (YOLO_WIDTH / FRAME_WIDTH))
+    x_scale = FRAME_WIDTH / YOLO_WIDTH
+    y_scale = FRAME_HEIGHT / yolo_h
+
+    # Start the background OCR processing thread.
+    threading.Thread(target=ocr_processing_thread, daemon=True).start()
+
+    while True:
+        frame = cam.capture_array()
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
+        frame_count += 1
+
+        # Periodically run the heavier YOLO model for performance.
+        if frame_count % YOLO_INTERVAL == 0:
+            frame_resized_for_yolo = cv2.resize(frame, (YOLO_WIDTH, yolo_h))
+            yolo_results = yolo_model(frame_resized_for_yolo, conf=0.25, verbose=False)
+
+            new_boxes = []
+            should_queue_for_ocr = (frame_count % OCR_INTERVAL == 0)
+
+            for r in yolo_results:
                 for box in r.boxes:
-                    # Scale bounding box coordinates back to original frame size
-                    x1_small, y1_small, x2_small, y2_small = box.xyxy[0].cpu().numpy()
-                    x_scale = original_w / YOLO_WIDTH
-                    y_scale = original_h / yolo_h
-                    x1 = int(x1_small * x_scale)
-                    y1 = int(y1_small * y_scale)
-                    x2 = int(x2_small * x_scale)
-                    y2 = int(y2_small * y_scale)
+                    x1_s, y1_s, x2_s, y2_s = box.xyxy[0].cpu().numpy()
+                    x1 = int(x1_s * x_scale)
+                    y1 = int(y1_s * y_scale)
+                    x2 = int(x2_s * x_scale)
+                    y2 = int(y2_s * y_scale)
+                    new_boxes.append((x1, y1, x2, y2))
 
-                    # Add the scaled box to our list for drawing
-                    last_yolo_boxes.append((x1, y1, x2, y2))
-                    
-                    # Add region to OCR queue (gated by its own interval)
-                    if frame_count % OCR_INTERVAL == 0 and not ocr_queue.full():
-                        roi = frame[y1:y2, x1:x2]
+                    if should_queue_for_ocr and not ocr_queue.full():
                         try:
-                            ocr_queue.put_nowait((roi, x1, y1))
-                        except:
+                            ocr_queue.put_nowait((frame[y1:y2, x1:x2], x1, y1))
+                        except Full:
                             pass
+            
+            last_yolo_boxes = new_boxes
 
-            # If detection ran but found no boxes, clear stale data.
+            # If YOLO finds no objects, clear previous (now stale) results.
             if not last_yolo_boxes:
-                # Clear the results currently being displayed
                 with ocr_lock:
                     current_ocr_results.clear()
-                
-                # Empty the queue of any pending (now irrelevant) work
-                while not ocr_queue.empty():
-                    try:
-                        ocr_queue.get_nowait()
-                    except Empty:
-                        continue
-    
-    # --- STEP 3: Draw the last known boxes on EVERY frame ---
-    for (x1, y1, x2, y2) in last_yolo_boxes:
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-    
-    # Draw current OCR results
-    with ocr_lock:
-        results_to_draw = list(current_ocr_results)
-    
-    # Create black strip for text display
-    strip_height = 60
-    text_panel = np.zeros((strip_height, frame.shape[1], 3), dtype=np.uint8)
+                with ocr_queue.mutex:
+                    ocr_queue.queue.clear()
 
-    # Compose line of text
-    full_line = "BRAND NAME: " + " ".join([text for _, text, _ in results_to_draw])
-    cv2.putText(text_panel, full_line, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        # Draw the last known bounding boxes on every frame for visual stability.
+        for (x1, y1, x2, y2) in last_yolo_boxes:
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
 
-    # Stack frame and text panel
-    combined = np.vstack((frame, text_panel))
-    
-    cv2.imshow("OCR Feed", combined)
-    
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+        # Safely copy the latest OCR results for drawing.
+        with ocr_lock:
+            results_to_draw = list(current_ocr_results)
 
-cv2.destroyAllWindows()
-cam.stop()
+        # Create a display panel for the recognized text.
+        text_panel = np.zeros((60, frame.shape[1], 3), dtype=np.uint8)
+        recognized_text = " ".join([text for _, text, _ in results_to_draw])
+        cv2.putText(text_panel, f"BRAND NAME: {recognized_text}", (10, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+
+        combined_view = np.vstack((frame, text_panel))
+        cv2.imshow("Brand Recognizer", combined_view)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cv2.destroyAllWindows()
+    cam.stop()
+
+if __name__ == "__main__":
+    main()
